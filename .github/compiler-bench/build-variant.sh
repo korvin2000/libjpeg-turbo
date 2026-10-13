@@ -83,9 +83,10 @@ train() {
             tj $img 95                                   # gray, 4:2:0, 4:2:2, 4:4:4
             tj $img 75 -subsamp 420 -progressive
             tj $img 95 -subsamp 420 -arithmetic
-            tj $img 95 -subsamp 420 -precision 12
             JSIMD_FORCENONE=1 tj $img 95 -subsamp 420
         done
+        tj testorig.ppm 95 -subsamp 420 -precision 12      # (BMP input is 8-bit only)
+        tj testorig.ppm 95 -subsamp 444 -precision 12 -progressive
         tj monkey16.pgm 1 -lossless -precision 16
         tj testorig.ppm 1 -lossless -precision 16
         tj testorig.jpg                                  # decompression + lossless transforms
