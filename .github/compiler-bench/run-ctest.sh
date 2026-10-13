@@ -12,9 +12,9 @@
 # float-IDCT output must be within 1 LSB of the reference decoder's (ppmdiff.py). Any other failure fails.
 set -uo pipefail
 
-B=$1
-OUT=$2
-IMG=$3
+B=$(cd "$1" && pwd)
+OUT=$(cd "$2" && pwd)
+IMG=$(cd "$3" && pwd)
 HERE=$(cd "$(dirname "$0")" && pwd)
 CTEST=${CTEST:-ctest}
 JOBS=${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
