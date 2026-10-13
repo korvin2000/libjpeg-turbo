@@ -197,7 +197,9 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: 1
         run: |
           set -euo pipefail
-          brew update --quiet   # the runner image's formula index is weeks old (auto-update is off)
+          # the runner image's formula index is weeks old (auto-update is off); 'brew update' can fail on
+          # unrelated migrations of preinstalled packages (e.g. azure-cli formula -> cask), which is harmless
+          brew update --quiet || echo "::warning::brew update reported an error (unrelated migration?) - continuing"
           brew install llvm nasm ninja
           brew info --json=v2 llvm | python3 -c "import sys,json; print('llvm', json.load(sys.stdin)['formulae'][0]['installed'][0]['version'])"
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
