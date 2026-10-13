@@ -22,6 +22,10 @@ on:
         description: 'Publish the tested builds as GitHub release natives-all-<YYYYMMDD>'
         type: boolean
         default: false
+      diag:
+        description: 'Diagnostics: rebuild bmpsizetest with flag subsets (Linux/macOS)'
+        type: boolean
+        default: false
   push:
     tags: ['natives-all-*']
 
@@ -123,6 +127,11 @@ jobs:
 
       - name: Test (full CTest suite, native)
         run: bash .github/natives/build-native.sh test ${{ matrix.platform }} "$D"
+
+      - name: Diagnostics (bmpsizetest with flag subsets)
+        if: ${{ !cancelled() && inputs.diag && runner.os != 'Windows' }}
+        continue-on-error: true
+        run: bash .github/natives/build-native.sh diag ${{ matrix.platform }} "$D"
 
       - name: Package (install tree, checks, smoke test, zip)
         run: bash .github/natives/build-native.sh package ${{ matrix.platform }} "$D"
