@@ -1,0 +1,377 @@
+name: Windows x64 compilers (GCC snapshot vs Clang nightly) build, test, benchmark + release
+
+# Builds libjpeg-turbo (DLLs, static libs, tools) for Windows x64 with development compilers and compares
+# their performance:
+#   gcc17          GCC 17 trunk weekly snapshot (gcc.gnu.org/pub/gcc/snapshots/LATEST-17); no Windows
+#                  distribution ships it, so a Linux-hosted x86_64-w64-mingw32 cross toolchain is built
+#                  (.github/compiler-bench/build-gcc-mingw-cross.sh, UCRT, mingw-w64 master) and cached
+#   clang-nightly  llvm-mingw nightly (LLVM main, UCRT, lld) - github.com/mstorsjo/llvm-mingw
+#   (input 'stable', on by default: also GCC 16.2 cross + llvm-mingw release with Clang 23 as references)
+# in the variants of .github/compiler-bench/build-variant.sh:
+#   base          project defaults (Release = -O3, generic x86-64)
+#   avx2          -O3 -march=x86-64-v3 -ffast-math         (needs an AVX2/FMA/BMI2 CPU: Haswell / Zen 1+)
+#   avx2-lto      avx2 + LTO
+#   avx2-lto-pgo  avx2-lto + PGO (training run under Wine on testimages/)
+# The NASM SIMD extensions (SSE2/AVX2, dispatched at run time) are in every build. Builds are
+# cross-compiled on Linux (identical flow for both compilers); every build then runs the project's full
+# CTest suite natively on Windows, and all builds are benchmarked with tjbench on ONE Windows runner in
+# interleaved rounds (.github/compiler-bench/bench.py; results in the job summary + artifact).
+# Release: pushing a tag 'win64-*' (or Run workflow with 'release') publishes every tested build as a
+# GitHub pre-release, ranked by the benchmark.
+#
+# Manual: Actions tab -> this workflow -> Run workflow (needs the file on the default branch); also runs
+# on push to the 'compiler-bench' branch.
+on:
+  workflow_dispatch:
+    inputs:
+      gcc_snapshot:
+        description: 'GCC 17 snapshot (gcc-17-YYYYMMDD); empty = latest'
+        default: ''
+      stable:
+        description: 'Also build stable GCC 16.2 + Clang 23 as references'
+        type: boolean
+        default: true
+      rounds:
+        description: 'Benchmark rounds (interleaved)'
+        default: '5'
+      release:
+        description: 'Publish the tested builds as a GitHub pre-release'
+        type: boolean
+        default: false
+  push:
+    branches: ['compiler-bench']
+    tags: ['win64-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compilers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BINUTILS_VER: '2.47'
+  MINGW_VER: '63ebe6cdb3ec4d5c586b7f0f0c03dd502e44c296'   # mingw-w64 master (v14.0.0 CRT fails with GCC 17)
+  GCC_STABLE: 'gcc-16.2.0'
+  LLVM_MINGW_STABLE: '20261006'                           # LLVM 23.1.3
+  VARIANTS: 'base avx2 avx2-lto avx2-lto-pgo'
+  STABLE_VARIANTS: 'avx2-lto'
+  CORPUS_URL: 'http://imagecompression.info/test_images/rgb8bit.zip'
+  CORPUS_IMAGES: 'nightshot_iso_100.ppm artificial.ppm'   # the images of libjpeg-turbo.org/About/Performance
+
+jobs:
+  resolve:
+    name: resolve compiler versions
+    runs-on: ubuntu-24.04
+    outputs:
+      gcc_toolchains: ${{ steps.r.outputs.gcc_toolchains }}
+      builds: ${{ steps.r.outputs.builds }}
+    env:
+      STABLE: ${{ github.event_name != 'workflow_dispatch' || inputs.stable }}
+    steps:
+      - id: r
+        name: Pick the GCC snapshot and the build matrix
+        env:
+          SNAP: ${{ inputs.gcc_snapshot }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SNAP" ]; then
+            SNAP=$(curl -fsSL --retry 5 https://gcc.gnu.org/pub/gcc/snapshots/LATEST-17/ | grep -oE 'gcc-17-[0-9]{8}' | head -1)
+          fi
+          test -n "$SNAP"
+          tc="{\"name\":\"gcc17\",\"ver\":\"$SNAP\",\"url\":\"https://gcc.gnu.org/pub/gcc/snapshots/${SNAP#gcc-}/$SNAP.tar.xz\"}"
+          builds=""
+          add() { for v in $2; do builds="$builds{\"compiler\":\"$1\",\"variant\":\"$v\"},"; done; }
+          add gcc17 "$VARIANTS"
+          add clang-nightly "$VARIANTS"
+          if [ "$STABLE" = "true" ]; then
+            tc="$tc,{\"name\":\"gcc16\",\"ver\":\"$GCC_STABLE\",\"url\":\"https://gcc.gnu.org/pub/gcc/releases/$GCC_STABLE/$GCC_STABLE.tar.xz\"}"
+            add gcc16 "$STABLE_VARIANTS"
+            add clang23 "$STABLE_VARIANTS"
+          fi
+          echo "gcc_toolchains=[$tc]" >> "$GITHUB_OUTPUT"
+          echo "builds=[${builds%,}]" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Download llvm-mingw once (the nightly asset is replaced daily)
+        run: |
+          set -euo pipefail
+          mkdir tc
+          curl -fsSL --retry 5 -o tc/llvm-mingw-clang-nightly.tar.xz \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/nightly/llvm-mingw-nightly-ucrt-ubuntu-22.04-x86_64.tar.xz
+          if [ "$STABLE" = "true" ]; then
+            curl -fsSL --retry 5 -o tc/llvm-mingw-clang23.tar.xz \
+              https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_STABLE/llvm-mingw-$LLVM_MINGW_STABLE-ucrt-ubuntu-22.04-x86_64.tar.xz
+          fi
+          ls -l tc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tc-llvm-mingw
+          path: tc/
+          retention-days: 3
+          compression-level: 0
+
+  gcc-toolchain:
+    name: GCC cross toolchain (${{ matrix.tc.ver }})
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      matrix:
+        tc: ${{ fromJSON(needs.resolve.outputs.gcc_toolchains) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/tc/mingw-${{ matrix.tc.name }}
+          key: mingw-cross-${{ matrix.tc.ver }}-binutils${{ env.BINUTILS_VER }}-${{ env.MINGW_VER }}-${{ hashFiles('.github/compiler-bench/build-gcc-mingw-cross.sh') }}
+
+      - name: Build the cross toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bison flex texinfo libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+          WORK="$RUNNER_TEMP/gcc-work" bash .github/compiler-bench/build-gcc-mingw-cross.sh \
+            "${{ matrix.tc.url }}" ~/tc/mingw-${{ matrix.tc.name }}
+
+      - name: Toolchain info
+        run: |
+          ~/tc/mingw-${{ matrix.tc.name }}/bin/x86_64-w64-mingw32-gcc -v 2>&1 | tail -3
+          du -sh ~/tc/mingw-${{ matrix.tc.name }}
+
+  build:
+    name: build ${{ matrix.compiler }}-${{ matrix.variant }}
+    needs: [resolve, gcc-toolchain]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.builds) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NASM + Ninja (+ Wine for the PGO training run)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm ninja-build
+          if [[ "${{ matrix.variant }}" == *pgo ]]; then
+            sudo apt-get install -y --no-install-recommends wine64 wine
+          fi
+          nasm -v; cmake --version | head -1
+
+      - name: GCC toolchain cache key
+        id: key
+        if: startsWith(matrix.compiler, 'gcc')
+        env:
+          TOOLCHAINS: ${{ needs.resolve.outputs.gcc_toolchains }}
+        run: |
+          VER=$(echo "$TOOLCHAINS" | jq -r '.[] | select(.name == "${{ matrix.compiler }}") | .ver')
+          echo "key=mingw-cross-$VER-binutils$BINUTILS_VER-$MINGW_VER-${{ hashFiles('.github/compiler-bench/build-gcc-mingw-cross.sh') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the GCC cross toolchain
+        if: startsWith(matrix.compiler, 'gcc')
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/tc/mingw-${{ matrix.compiler }}
+          key: ${{ steps.key.outputs.key }}
+          fail-on-cache-miss: true
+
+      - name: Get llvm-mingw
+        if: startsWith(matrix.compiler, 'clang')
+        uses: actions/download-artifact@v4
+        with:
+          name: tc-llvm-mingw
+          path: ${{ runner.temp }}/tc-dl
+
+      - name: Put the toolchain on PATH
+        run: |
+          set -euo pipefail
+          case "${{ matrix.compiler }}" in
+            gcc*)   echo ~/tc/mingw-${{ matrix.compiler }}/bin >> "$GITHUB_PATH" ;;
+            clang*) mkdir -p ~/tc/llvm-mingw
+                    tar -xJf "$RUNNER_TEMP/tc-dl/llvm-mingw-${{ matrix.compiler }}.tar.xz" -C ~/tc/llvm-mingw --strip-components=1
+                    echo ~/tc/llvm-mingw/bin >> "$GITHUB_PATH" ;;
+          esac
+
+      - name: Cross-build
+        run: |
+          set -euo pipefail
+          D=dist/${{ matrix.compiler }}-${{ matrix.variant }}
+          bash .github/compiler-bench/build-variant.sh "${{ startsWith(matrix.compiler, 'gcc') && 'gcc' || 'clang' }}" \
+            ${{ matrix.variant }} $D
+          # effective optimization flags, in command-line order (the last -O wins)
+          echo "effective: $(grep -oE -- ' -(O[0-3s]?|march=[^ ]+|flto[^ ]*|ffast-math|fprofile-[^ ]+)( |$)' $D/cc-cmd.txt | tr -d '\n')"
+          echo "ymm (AVX) instructions in libturbojpeg.dll: $(x86_64-w64-mingw32-objdump -d $D/install/bin/libturbojpeg.dll | grep -c ymm)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.compiler }}-${{ matrix.variant }}
+          path: dist/${{ matrix.compiler }}-${{ matrix.variant }}/
+
+  test:
+    name: test ${{ matrix.compiler }}-${{ matrix.variant }}
+    needs: [resolve, build]
+    if: ${{ !cancelled() }}   # test whatever built (a failed build's test fails at its artifact download)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.builds) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only configures the CTest tree natively (no native build): the tests then run the cross-built
+      # executables, which are copied to the same relative paths.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-${{ matrix.compiler }}-${{ matrix.variant }}
+          path: xbuild
+
+      - name: Verify the binaries (x86-64 PE, no MinGW runtime DLL imports)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cat xbuild/info.txt
+          for f in xbuild/install/bin/*.dll xbuild/install/bin/*.exe; do
+            objdump -f "$f" | grep -q 'file format pei-x86-64'
+            imports=$(objdump -p "$f" | sed -n 's/^\s*DLL Name: *//p')
+            echo "$(basename "$f"): $(echo $imports)"
+            if echo "$imports" | grep -iE '^lib' | grep -viE '^lib(jpeg-62|turbojpeg)\.dll$'; then
+              echo "::error::$f depends on a MinGW runtime DLL"; exit 1
+            fi
+          done
+
+      - name: Configure the CTest tree, swap in the cross-built binaries
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          FT12=$(sed -n 's/^floattest12: *//p' xbuild/info.txt)
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DREQUIRE_SIMD=1 -DFLOATTEST12="$FT12" > cmake.log \
+            || { cat cmake.log; exit 1; }
+          grep -E '^-- (SIMD extensions|FLOATTEST)' cmake.log
+          cp -r xbuild/testbin/. build/
+          echo "$(find build -path build/CMakeFiles -prune -o -name '*.exe' -print | wc -l) cross-built executables"
+
+      - name: Run the test suite (ctest)
+        shell: msys2 {0}
+        run: ctest --test-dir build -j4 --output-on-failure --timeout 900
+
+      - name: Mark as tested
+        shell: bash
+        run: cp xbuild/info.txt tested.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tested-${{ matrix.compiler }}-${{ matrix.variant }}
+          path: tested.txt
+
+  bench:
+    name: benchmark (all builds, one runner)
+    needs: [resolve, build]
+    if: ${{ !cancelled() }}   # benchmark whatever built
+    runs-on: windows-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+
+      - id: corpus
+        uses: actions/cache@v4
+        with:
+          path: corpus
+          key: corpus-rgb8bit-v1
+
+      - name: Download the image corpus (imagecompression.info 8-bit RGB set)
+        if: steps.corpus.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 5 --retry-delay 15 -o rgb8bit.zip "$CORPUS_URL"
+          mkdir -p corpus
+          7z e -ocorpus rgb8bit.zip $CORPUS_IMAGES -r
+          ls -l corpus
+
+      - name: Benchmark
+        shell: bash
+        env:
+          ROUNDS: ${{ inputs.rounds || '5' }}
+        run: |
+          set -euxo pipefail
+          for d in dist/bin-*; do mv "$d" "dist/${d#dist/bin-}"; done
+          for d in dist/*/; do echo "== $d"; cat "$d/info.txt"; done
+          python .github/compiler-bench/bench.py --builds-dir dist --rounds "$ROUNDS" \
+            --images $(for i in $CORPUS_IMAGES; do echo corpus/$i; done) --out bench-results
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench-results/
+
+  release:
+    name: publish GitHub release
+    needs: [resolve, build, test, bench]
+    if: ${{ !cancelled() && needs.bench.result == 'success' && (startsWith(github.ref, 'refs/tags/') || inputs.release) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+
+      - name: Package the tested builds and publish (ranked by the benchmark)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER=$(sed -n 's/^set(VERSION \(.*\))/\1/p' CMakeLists.txt)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then TAG=$GITHUB_REF_NAME
+          else TAG="win64-compilers-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"; fi
+          mapfile -t RANKED < <(jq -r '.ranking[]' art/bench-results/results.json)
+          mkdir -p pkg; FILES=(); WINNER=""
+          for b in "${RANKED[@]}"; do
+            [ -f "art/tested-$b/tested.txt" ] || { echo "skip $b (not tested OK)"; continue; }
+            [ -n "$WINNER" ] || WINNER=$b
+            n="libjpeg-turbo-$VER-win64-$b"
+            mkdir -p "pkg/$n" && cp -r "art/bin-$b/install/." "pkg/$n/" && cp "art/bin-$b/info.txt" "pkg/$n/"
+            (cd pkg && zip -qr9 "$n.zip" "$n")
+            FILES+=("pkg/$n.zip")
+          done
+          test -n "$WINNER"
+          {
+            echo "libjpeg-turbo $VER for Windows x64 (UCRT, static runtime: no MinGW DLLs), built by CI with"
+            echo "development compilers and ranked by a tjbench benchmark on one GitHub Windows runner."
+            echo
+            echo "**Fastest tested build: \`$WINNER\`** (\`libjpeg-turbo-$VER-win64-$WINNER.zip\`)."
+            echo
+            echo "\`avx2*\` builds need an AVX2/FMA/BMI2 CPU (Intel Haswell / AMD Zen 1 or newer); \`base\` runs on any"
+            echo "x86-64 CPU. Static libraries in LTO builds of Clang hold LLVM bitcode (use them with Clang/lld only)."
+            echo "Commit: $GITHUB_SHA, run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            cat art/bench-results/summary.md
+          } > notes.md
+          gh release create "$TAG" "${FILES[@]}" art/bench-results/summary.md art/bench-results/results.json \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "libjpeg-turbo $VER Windows x64 - GCC 17 vs Clang nightly (winner: $WINNER)" --notes-file notes.md
