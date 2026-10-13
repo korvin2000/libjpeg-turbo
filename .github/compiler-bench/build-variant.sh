@@ -112,7 +112,7 @@ if [ "$VARIANT" = avx2-lto-pgo ]; then
         ls "$PROF"/*.profraw
         llvm-profdata merge -o "$PROF/merged.profdata" "$PROF"/*.profraw
     fi
-    find "$PROF" -type f | head -5; echo "$(find "$PROF" -type f | wc -l) profile files"
+    echo "$(find "$PROF" -type f | wc -l) profile files"   # (no '| head': SIGPIPE + pipefail)
     test -n "$(find "$PROF" -type f -name '*.gcda' -o -type f -name 'merged.profdata')"
     echo "::endgroup::"
     EXTRA=$PGO_USE
