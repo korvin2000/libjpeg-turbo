@@ -1,0 +1,80 @@
+name: Release
+
+# Builds + tests every platform (platforms.yml) from the tagged commit and publishes a GitHub release with
+# the per-platform zips, SHA256SUMS.txt and the compiler benchmark results (bench-results.md).
+#
+# How to cut a release (either way):
+#   * Actions tab -> "Release" -> Run workflow -> enter a new tag (e.g. Release-3.2.1-ci2), tick
+#     "pre-release" if wanted. The tag is created on the selected branch's head commit.
+#   * or push a tag:  git tag Release-3.2.1-ci2 && git push origin Release-3.2.1-ci2
+# The zips are named after VERSION in CMakeLists.txt.
+on:
+  push:
+    tags: ['Release-*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create, e.g. Release-3.2.1-ci2'
+        required: true
+      prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/platforms.yml
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: all-platform-zips
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          PRERELEASE: ${{ inputs.prerelease && '--prerelease' || '' }}
+        run: |
+          set -euxo pipefail
+          VER=$(sed -n 's/^set(VERSION \(.*\))/\1/p' CMakeLists.txt)
+          test -n "$VER"
+          cp bench-results.md "dist/bench-results-$VER.md"
+          (cd dist && sha256sum *.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          {
+            echo "libjpeg-turbo $VER for Windows, Linux and macOS on x64 and arm64: performance-optimized builds"
+            echo "made with the newest compilers, built and tested by GitHub Actions"
+            echo "([run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}), commit ${GITHUB_SHA})."
+            echo
+            echo "Each \`libjpeg-turbo-$VER-<platform>.zip\` holds one folder with \`bin/\` (shared libraries on Windows +"
+            echo "cjpeg, djpeg, jpegtran, tjbench, ...), \`lib/\` (shared libraries on Linux/macOS, static libraries, import"
+            echo "libraries, CMake and pkg-config files), \`include/\`, \`share/\` (docs) and \`BUILDINFO.txt\` (compiler + flags)."
+            echo
+            cat dist/platforms.md
+            echo
+            echo "* **Optimizations**: \`-O3 -ffast-math\` + LTO (shared libraries and tools; the static libraries are plain"
+            echo "  object code usable by any compiler/linker) + PGO. libjpeg-turbo's own SIMD code (SSE2/AVX2 on x64, picked"
+            echo "  at run time; NEON on arm64) is in every build."
+            echo "* **\`*-x64-avx2\`** builds additionally use \`-march=x86-64-v3\` (AVX2/FMA/BMI2): Intel Haswell / AMD Zen 1"
+            echo "  or newer, otherwise they crash with an illegal instruction - use the portable \`*-x64\` zip there. On"
+            echo "  Windows the AVX2 build is the winner of the GCC 17 vs Clang benchmark: +13% over the GCC 17 baseline"
+            echo "  (\`bench-results-$VER.md\`)."
+            echo "* **Linux**: built on Ubuntu 22.04, needs glibc 2.35+ and nothing else. **macOS**: 11.0+; the x64 builds"
+            echo "  were tested under Rosetta 2 and smoke-tested on an Intel Mac. **Windows**: UCRT (Windows 10+), no MinGW"
+            echo "  runtime DLLs."
+            echo "* **Tests**: every build passed the project's CTest suite on its platform (Windows x64: natively with the"
+            echo "  cross-built binaries) and a smoke test of the unpacked zip whose integer-path outputs must be identical on"
+            echo "  every platform. Tools in \`bin/\` find the shared libraries relative to themselves (unpack anywhere)."
+          } > notes.md
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt "dist/bench-results-$VER.md" \
+            --target "$GITHUB_SHA" --title "libjpeg-turbo $VER ($TAG)" --notes-file notes.md $PRERELEASE

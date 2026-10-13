@@ -10,14 +10,16 @@ name: Windows x64 compilers (GCC snapshot vs Clang nightly) build, test, benchma
 # in the variants of .github/compiler-bench/build-variant.sh:
 #   base          project defaults (Release = -O3, generic x86-64)
 #   avx2          -O3 -march=x86-64-v3 -ffast-math         (needs an AVX2/FMA/BMI2 CPU: Haswell / Zen 1+)
-#   avx2-lto      avx2 + LTO
+#   avx2-lto      avx2 + LTO (shared libs + executables; static libs stay plain object code)
 #   avx2-lto-pgo  avx2-lto + PGO (training run under Wine on testimages/)
+#   lto-pgo       portable x86-64: -O3 -ffast-math + LTO + PGO (only on request, see 'only')
 # The NASM SIMD extensions (SSE2/AVX2, dispatched at run time) are in every build. Builds are
 # cross-compiled on Linux (identical flow for both compilers); every build then runs the project's full
 # CTest suite natively on Windows, and all builds are benchmarked with tjbench on ONE Windows runner in
 # interleaved rounds (.github/compiler-bench/bench.py; results in the job summary + artifact).
 # Release: pushing a tag 'win64-*' (or Run workflow with 'release') publishes every tested build as a
-# GitHub release, ranked by the benchmark.
+# GitHub release, ranked by the benchmark. The multi-platform release (release.yml -> platforms.yml)
+# calls this workflow with 'only' = the Windows x64 release builds and no benchmark.
 #
 # Manual: Actions tab -> this workflow -> Run workflow (needs the file on the default branch); also runs
 # on push to the 'compiler-bench' branch.
@@ -31,11 +33,40 @@ on:
         description: 'Also build stable GCC 16.2 + Clang 23 as references'
         type: boolean
         default: true
+      only:
+        description: 'Build only these <compiler>-<variant> builds (comma-separated); empty = full matrix'
+        default: ''
+      bench:
+        description: 'Run the benchmark'
+        type: boolean
+        default: true
       rounds:
         description: 'Benchmark rounds (interleaved)'
         default: '5'
       release:
         description: 'Publish the tested builds as a GitHub release'
+        type: boolean
+        default: false
+  workflow_call:   # (the caller must allow 'contents: write' for the nested release job, which only
+                   # runs with 'release' and a finished benchmark)
+    inputs:
+      only:
+        description: 'Build only these <compiler>-<variant> builds (comma-separated); empty = full matrix'
+        type: string
+        default: ''
+      bench:
+        type: boolean
+        default: false
+      gcc_snapshot:
+        type: string
+        default: ''
+      stable:
+        type: boolean
+        default: false
+      rounds:
+        type: string
+        default: '5'
+      release:
         type: boolean
         default: false
   push:
@@ -45,8 +76,8 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: compilers-${{ github.ref }}
+concurrency:   # (github.workflow = the caller's name when called from another workflow)
+  group: compilers-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -67,7 +98,9 @@ jobs:
       gcc_toolchains: ${{ steps.r.outputs.gcc_toolchains }}
       builds: ${{ steps.r.outputs.builds }}
     env:
-      STABLE: ${{ github.event_name != 'workflow_dispatch' || inputs.stable }}
+      # inputs are empty on push; 'only' (manual or called runs) overrides the matrix
+      STABLE: ${{ github.event_name == 'push' || inputs.stable }}
+      ONLY: ${{ inputs.only }}
     steps:
       - id: r
         name: Pick the GCC snapshot and the build matrix
@@ -75,35 +108,50 @@ jobs:
           SNAP: ${{ inputs.gcc_snapshot }}
         run: |
           set -euo pipefail
-          if [ -z "$SNAP" ]; then
-            SNAP=$(curl -fsSL --retry 5 https://gcc.gnu.org/pub/gcc/snapshots/LATEST-17/ | grep -oE 'gcc-17-[0-9]{8}' | head -1)
+          if [ -n "$ONLY" ]; then
+            names=$(echo "$ONLY" | tr ', ' '\n\n' | grep -v '^$' | sort -u)
+            # the GCC float-IDCT tolerance check of GCC avx2* builds compares against gcc17-base
+            if echo "$names" | grep -qE '^gcc[0-9]+-avx2'; then names=$(printf '%s\ngcc17-base' "$names" | sort -u); fi
+          else
+            names=$(for c in gcc17 clang-nightly; do for v in $VARIANTS; do echo $c-$v; done; done
+                    if [ "$STABLE" = "true" ]; then for c in gcc16 clang23; do for v in $STABLE_VARIANTS; do echo $c-$v; done; done; fi)
           fi
-          test -n "$SNAP"
-          tc="{\"name\":\"gcc17\",\"ver\":\"$SNAP\",\"url\":\"https://gcc.gnu.org/pub/gcc/snapshots/${SNAP#gcc-}/$SNAP.tar.xz\"}"
-          builds=""
-          add() { for v in $2; do builds="$builds{\"compiler\":\"$1\",\"variant\":\"$v\"},"; done; }
-          add gcc17 "$VARIANTS"
-          add clang-nightly "$VARIANTS"
-          if [ "$STABLE" = "true" ]; then
-            tc="$tc,{\"name\":\"gcc16\",\"ver\":\"$GCC_STABLE\",\"url\":\"https://gcc.gnu.org/pub/gcc/releases/$GCC_STABLE/$GCC_STABLE.tar.xz\"}"
-            add gcc16 "$STABLE_VARIANTS"
-            add clang23 "$STABLE_VARIANTS"
+          builds="" tc="" compilers=""
+          for n in $names; do
+            c=$(echo "$n" | grep -oE '^(gcc17|gcc16|clang-nightly|clang23)') || { echo "::error::unknown build '$n'"; exit 1; }
+            builds="$builds{\"compiler\":\"$c\",\"variant\":\"${n#$c-}\"},"
+            compilers="$compilers $c"
+          done
+          if echo "$compilers" | grep -qw gcc17; then
+            if [ -z "$SNAP" ]; then
+              SNAP=$(curl -fsSL --retry 5 https://gcc.gnu.org/pub/gcc/snapshots/LATEST-17/ | grep -oE 'gcc-17-[0-9]{8}' | head -1)
+            fi
+            test -n "$SNAP"
+            tc="$tc{\"name\":\"gcc17\",\"ver\":\"$SNAP\",\"url\":\"https://gcc.gnu.org/pub/gcc/snapshots/${SNAP#gcc-}/$SNAP.tar.xz\"},"
           fi
-          echo "gcc_toolchains=[$tc]" >> "$GITHUB_OUTPUT"
+          if echo "$compilers" | grep -qw gcc16; then
+            tc="$tc{\"name\":\"gcc16\",\"ver\":\"$GCC_STABLE\",\"url\":\"https://gcc.gnu.org/pub/gcc/releases/$GCC_STABLE/$GCC_STABLE.tar.xz\"},"
+          fi
+          echo "gcc_toolchains=[${tc%,}]" >> "$GITHUB_OUTPUT"
           echo "builds=[${builds%,}]" >> "$GITHUB_OUTPUT"
+          echo "clangs=$(echo $compilers | tr ' ' '\n' | grep '^clang' | sort -u | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
 
       - name: Download llvm-mingw once (the nightly asset is replaced daily)
+        env:
+          CLANGS: ${{ steps.r.outputs.clangs }}
         run: |
           set -euo pipefail
           mkdir tc
-          curl -fsSL --retry 5 -o tc/llvm-mingw-clang-nightly.tar.xz \
-            https://github.com/mstorsjo/llvm-mingw/releases/download/nightly/llvm-mingw-nightly-ucrt-ubuntu-22.04-x86_64.tar.xz
-          if [ "$STABLE" = "true" ]; then
-            curl -fsSL --retry 5 -o tc/llvm-mingw-clang23.tar.xz \
-              https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_STABLE/llvm-mingw-$LLVM_MINGW_STABLE-ucrt-ubuntu-22.04-x86_64.tar.xz
-          fi
-          ls -l tc
+          for c in $CLANGS; do
+            case $c in
+              clang-nightly) URL=https://github.com/mstorsjo/llvm-mingw/releases/download/nightly/llvm-mingw-nightly-ucrt-ubuntu-22.04-x86_64.tar.xz ;;
+              clang23)       URL=https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_STABLE/llvm-mingw-$LLVM_MINGW_STABLE-ucrt-ubuntu-22.04-x86_64.tar.xz ;;
+            esac
+            curl -fsSL --retry 5 -o tc/llvm-mingw-$c.tar.xz "$URL"
+          done
+          echo "llvm-mingw toolchains: ${CLANGS:-none}" > tc/README.txt
+          ls -la tc
 
       - uses: actions/upload-artifact@v4
         with:
@@ -115,6 +163,7 @@ jobs:
   gcc-toolchain:
     name: GCC cross toolchain (${{ matrix.tc.ver }})
     needs: resolve
+    if: needs.resolve.outputs.gcc_toolchains != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
@@ -146,6 +195,8 @@ jobs:
   build:
     name: build ${{ matrix.compiler }}-${{ matrix.variant }}
     needs: [resolve, gcc-toolchain]
+    # gcc-toolchain is skipped for Clang-only runs; a GCC build without its toolchain fails at the restore
+    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -234,9 +285,18 @@ jobs:
         with:
           msystem: UCRT64
           update: false
-          install: >-
-            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-nasm
-            mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+
+      # (instead of setup-msys2's 'install:', which fails the job on one slow mirror download)
+      - name: Install CMake, Ninja, NASM + the build's compiler family (retried)
+        shell: msys2 {0}
+        run: |
+          P="mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-nasm"
+          P="$P mingw-w64-ucrt-x86_64-${{ startsWith(matrix.compiler, 'gcc') && 'gcc' || 'clang' }}"
+          for i in 1 2 3 4 5; do
+            pacman -S --noconfirm --needed $P && break
+            echo "::warning::pacman attempt $i failed, retrying"; sleep $((i * 15))
+          done
+          cmake --version | head -1; ${{ startsWith(matrix.compiler, 'gcc') && 'gcc' || 'clang' }} --version | head -1
 
       - uses: actions/download-artifact@v4
         with:
@@ -313,7 +373,8 @@ jobs:
   bench:
     name: benchmark (all builds, one runner)
     needs: [resolve, build]
-    if: ${{ !cancelled() }}   # benchmark whatever built
+    # benchmark whatever built; inputs.bench: null on push = run, false when called by platforms.yml
+    if: ${{ !cancelled() && format('{0}', inputs.bench) != 'false' }}
     runs-on: windows-latest
     timeout-minutes: 300
     steps:
@@ -360,7 +421,7 @@ jobs:
   release:
     name: publish GitHub release
     needs: [resolve, build, test, bench]
-    if: ${{ !cancelled() && needs.bench.result == 'success' && (startsWith(github.ref, 'refs/tags/') || inputs.release) }}
+    if: ${{ !cancelled() && needs.bench.result == 'success' && (startsWith(github.ref, 'refs/tags/win64-') || inputs.release) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -397,7 +458,7 @@ jobs:
             echo "**Fastest tested build: \`$WINNER\`** (\`libjpeg-turbo-$VER-win64-$WINNER.zip\`)."
             echo
             echo "\`avx2*\` builds need an AVX2/FMA/BMI2 CPU (Intel Haswell / AMD Zen 1 or newer); \`base\` runs on any"
-            echo "x86-64 CPU. Static libraries in LTO builds of Clang hold LLVM bitcode (use them with Clang/lld only)."
+            echo "x86-64 CPU. LTO applies to the DLLs and tools; the static libraries are plain object code."
             echo "Every published build passed the project's CTest suite (662 tests) natively on Windows. In GCC"
             echo "\`avx2*\` builds (\`-ffast-math\`) the opt-in 12-bit *float* IDCT differs from the reference by at most"
             echo "1 LSB in ~0.01% of the samples, so its two exact-checksum tests are replaced by a 1-LSB tolerance check."

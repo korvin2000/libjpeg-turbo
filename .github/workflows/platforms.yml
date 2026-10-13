@@ -1,0 +1,335 @@
+name: CI (all platforms)
+
+# Builds + tests performance-optimized libjpeg-turbo for 3 OSes x 2 architectures, one release zip per
+# platform (libjpeg-turbo-<version>-<platform>.zip: shared + static libraries, headers, tools):
+#   Windows-x64, -x64-avx2  llvm-mingw nightly (Clang main), cross-built on Linux + full CTest suite on
+#                           Windows x64 - via windows-x64-compilers.yml (the benchmark workflow)
+#   Windows-arm64           llvm-mingw nightly, native windows-11-arm
+#   Linux-x64, -x64-avx2    Clang development snapshot (apt.llvm.org), native ubuntu-22.04 (glibc 2.35)
+#   Linux-arm64             Clang development snapshot (apt.llvm.org), native ubuntu-22.04-arm
+#   macOS-arm64             Homebrew LLVM (newest stable; no nightly LLVM binaries exist for macOS), macos-15
+#   macOS-x64, -x64-avx2    same, built on macos-15 for x86_64; tested under Rosetta 2 + a real Intel Mac
+# Optimizations (.github/compiler-bench/build-variant.sh): -O3 -ffast-math + LTO (shared libs and tools;
+# the static libraries stay plain object code) + PGO. The x64 builds come in two flavours: portable
+# (any x86-64 CPU; the SIMD code picks SSE2/AVX2 at run time) and -avx2 (-march=x86-64-v3: AVX2/FMA/BMI2,
+# Haswell / Zen 1 or newer; the benchmark winner, see bench-results.md). arm64: NEON, generic ARMv8-A.
+# Every build runs the project's full CTest suite and a smoke test of its unpacked zip
+# (.github/compiler-bench/smoke.sh: identical integer-path outputs on every platform).
+on:
+  push:
+    branches: ['main', 'ci-platforms']
+    paths-ignore: ['**/*.md', 'doc/**', 'release/**', 'java/**', 'fuzz/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+  workflow_call:   # release.yml builds the release zips through this workflow
+
+concurrency:
+  group: platforms-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+jobs:
+  windows-x64:
+    uses: ./.github/workflows/windows-x64-compilers.yml
+    permissions:
+      contents: write   # declared by its tag-triggered compiler-bench release job, which never runs here
+    with:
+      only: clang-nightly-lto-pgo,clang-nightly-avx2-lto-pgo
+      bench: false
+
+  windows-arm64:
+    name: Windows-arm64 build + test (llvm-mingw nightly, native)
+    runs-on: windows-11-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install llvm-mingw nightly (aarch64-hosted)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/nightly/llvm-mingw-nightly-ucrt-aarch64.zip"
+          Invoke-WebRequest -Uri $url -OutFile llvm-mingw.zip -MaximumRetryCount 5 -RetryIntervalSec 15
+          Expand-Archive -Path llvm-mingw.zip -DestinationPath C:\llvm-mingw-root -Force
+          $dir = (Get-ChildItem C:\llvm-mingw-root -Filter "llvm-mingw-*" -Directory | Select-Object -First 1).FullName
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build (lto-pgo)
+        shell: bash
+        env:
+          TARGET: native
+          CC: aarch64-w64-mingw32-clang
+        run: |
+          set -euo pipefail
+          $CC --version | head -1; cmake --version | head -1; ninja --version; python --version
+          bash .github/compiler-bench/build-variant.sh clang lto-pgo dist/Windows-arm64
+
+      - name: Verify the DLLs (ARM64 PE, no llvm-mingw runtime DLL imports)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in dist/Windows-arm64/install/bin/*.dll dist/Windows-arm64/install/bin/*.exe; do
+            llvm-readobj --file-headers "$f" | grep -q 'Machine: IMAGE_FILE_MACHINE_ARM64'
+            imports=$(llvm-readobj --coff-imports "$f" | sed -n 's/^ *Name: *//p')
+            echo "$(basename "$f"): $(echo $imports)"
+            if echo "$imports" | grep -iE '^lib' | grep -viE '^lib(jpeg-62|turbojpeg)\.dll$'; then
+              echo "::error::$f depends on an llvm-mingw runtime DLL"; exit 1
+            fi
+          done
+
+      - name: Test (ctest, native arm64)
+        shell: bash
+        run: ctest --test-dir dist/work-Windows-arm64/build -j4 --output-on-failure --timeout 900
+
+      - name: Smoke test of the install tree (moved away from the build tree)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -r dist/Windows-arm64/install "$RUNNER_TEMP/ljt-smoke"
+          bash .github/compiler-bench/smoke.sh "$RUNNER_TEMP/ljt-smoke" testimages
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-Windows-arm64
+          path: |
+            dist/Windows-arm64/install/
+            dist/Windows-arm64/info.txt
+
+  linux:
+    name: ${{ matrix.platform }} build + test (Clang snapshot, native)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: Linux-x64,      runner: ubuntu-22.04,     variant: lto-pgo,      machine: 'X86-64' }
+          - { platform: Linux-x64-avx2, runner: ubuntu-22.04,     variant: avx2-lto-pgo, machine: 'X86-64' }
+          - { platform: Linux-arm64,    runner: ubuntu-22.04-arm, variant: lto-pgo,      machine: 'AArch64' }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the newest Clang development snapshot (apt.llvm.org) + NASM + Ninja
+        run: |
+          set -euo pipefail
+          ARCH=$(dpkg --print-architecture)
+          V=$(curl -fsSL --retry 5 https://apt.llvm.org/jammy/dists/llvm-toolchain-jammy/main/binary-$ARCH/Packages.gz \
+              | gunzip | sed -n 's/^Package: clang-\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)
+          test -n "$V"
+          curl -fsSL --retry 5 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-$V lld-$V llvm-$V libclang-rt-$V-dev ninja-build nasm
+          echo /usr/lib/llvm-$V/bin >> "$GITHUB_PATH"
+
+      - name: Build (${{ matrix.variant }})
+        env:
+          TARGET: native
+          CC: clang
+          LDFLAGS: -fuse-ld=lld
+        run: |
+          set -euo pipefail
+          clang --version | head -1; ldd --version | head -1; cmake --version | head -1
+          bash .github/compiler-bench/build-variant.sh clang ${{ matrix.variant }} dist/${{ matrix.platform }}
+
+      - name: Verify (ELF ${{ matrix.machine }}, only glibc libraries NEEDed, GLIBC floor, no crtfastmath)
+        run: |
+          set -euo pipefail
+          D=dist/${{ matrix.platform }}/install
+          for f in $(find $D/lib -name 'lib*.so*' -type f) $D/bin/tjbench $D/bin/cjpeg; do
+            readelf -h "$f" | grep -qE 'Machine:.*${{ matrix.machine }}'
+            needed=$(readelf -d "$f" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')
+            floor=$(readelf -V "$f" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -uV | tail -1)
+            echo "$f: NEEDED $needed| $floor | $(readelf -d "$f" | grep -oE '(RUNPATH|RPATH).*' || true)"
+            for n in $needed; do
+              case $n in libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|ld-linux*|libjpeg.so.62|libturbojpeg.so.0) ;;
+                *) echo "::error::$f needs $n"; exit 1 ;;
+              esac
+            done
+            if [ "$(printf '%s\nGLIBC_2.35\n' "$floor" | sort -V | tail -1)" != GLIBC_2.35 ]; then
+              echo "::error::$f needs $floor (> glibc 2.35)"; exit 1
+            fi
+          done
+          if nm dist/work-${{ matrix.platform }}/build/lib*.so* 2>/dev/null | grep -w set_fast_math; then
+            echo "::error::a shared library contains crtfastmath.o (it would change the host's FP mode)"; exit 1
+          fi
+
+      - name: Test (ctest, native)
+        run: ctest --test-dir dist/work-${{ matrix.platform }}/build -j"$(nproc)" --output-on-failure --timeout 900
+
+      - name: Package + smoke test of the unpacked zip
+        run: |
+          set -euo pipefail
+          bash .github/compiler-bench/package.sh dist/${{ matrix.platform }} ${{ matrix.platform }} zips
+          mkdir "$RUNNER_TEMP/unzip" && unzip -q zips/*.zip -d "$RUNNER_TEMP/unzip"
+          bash .github/compiler-bench/smoke.sh "$RUNNER_TEMP"/unzip/libjpeg-turbo-* testimages
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zip-${{ matrix.platform }}
+          path: zips/*.zip
+          compression-level: 0
+
+  macos:
+    name: ${{ matrix.platform }} build + test (Homebrew LLVM, macos-15${{ matrix.rosetta && ', x86_64 under Rosetta 2' || '' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: macOS-arm64,    variant: lto-pgo,      arch: arm64,  rosetta: false }
+          - { platform: macOS-x64,      variant: lto-pgo,      arch: x86_64, rosetta: true }
+          - { platform: macOS-x64-avx2, variant: avx2-lto-pgo, arch: x86_64, rosetta: true }
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rosetta 2 (runs the x86_64 PGO training + tests; AVX2 needs macOS 15+)
+        if: matrix.rosetta
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Install Homebrew LLVM + NASM
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: |
+          set -euo pipefail
+          brew install llvm nasm ninja
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - name: Build (${{ matrix.variant }}, ${{ matrix.arch }})
+        env:
+          TARGET: native
+          CC: clang
+          CMAKE_EXTRA: -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          clang --version | head -1; sw_vers; cmake --version | head -1
+          bash .github/compiler-bench/build-variant.sh clang ${{ matrix.variant }} dist/${{ matrix.platform }}
+
+      - name: Verify (${{ matrix.arch }} only, macOS 11+, system libraries only, relative rpath)
+        run: |
+          set -euo pipefail
+          D=dist/${{ matrix.platform }}/install
+          for f in $(find $D/lib -name 'lib*.dylib' -type f) $D/bin/tjbench $D/bin/cjpeg; do
+            test "$(lipo -archs "$f")" = "${{ matrix.arch }}"
+            minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/ {b=1} b && /minos/ {print $2; exit}')
+            deps=$(otool -L "$f" | tail -n +2 | awk '{print $1}' | tr '\n' ' ')
+            echo "$f: minos $minos | $deps| $(otool -l "$f" | awk '/LC_RPATH/ {r=1} r && / path / {print $2; exit}')"
+            test "$minos" = "$MACOSX_DEPLOYMENT_TARGET"
+            for d in $deps; do
+              case $d in /usr/lib/libSystem.B.dylib|@rpath/libjpeg.62.dylib|@rpath/libturbojpeg.0.dylib) ;;
+                *) echo "::error::$f depends on $d"; exit 1 ;;
+              esac
+            done
+          done
+
+      - name: Test (ctest${{ matrix.rosetta && ', x86_64 binaries under Rosetta 2' || '' }})
+        run: ctest --test-dir dist/work-${{ matrix.platform }}/build -j"$(sysctl -n hw.ncpu)" --output-on-failure --timeout 900
+
+      - name: Package + smoke test of the unpacked zip
+        run: |
+          set -euo pipefail
+          bash .github/compiler-bench/package.sh dist/${{ matrix.platform }} ${{ matrix.platform }} zips
+          mkdir "$RUNNER_TEMP/unzip" && unzip -q zips/*.zip -d "$RUNNER_TEMP/unzip"
+          bash .github/compiler-bench/smoke.sh "$RUNNER_TEMP"/unzip/libjpeg-turbo-* testimages
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zip-${{ matrix.platform }}
+          path: zips/*.zip
+          compression-level: 0
+
+  macos-intel:
+    name: ${{ matrix.platform }} on a real Intel Mac (macos-15-intel) - smoke test
+    needs: macos
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macOS-x64, macOS-x64-avx2]
+    runs-on: macos-15-intel
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: zip-${{ matrix.platform }}
+          path: zips
+      - name: Smoke test (native x86_64)
+        run: |
+          set -euo pipefail
+          sysctl -n machdep.cpu.brand_string; sysctl -n machdep.cpu.leaf7_features | tr ' ' '\n' | grep -x AVX2 || true
+          mkdir "$RUNNER_TEMP/unzip" && unzip -q zips/*.zip -d "$RUNNER_TEMP/unzip"
+          bash .github/compiler-bench/smoke.sh "$RUNNER_TEMP"/unzip/libjpeg-turbo-* testimages
+
+  package:
+    name: all platform zips
+    needs: [windows-x64, windows-arm64, linux, macos, macos-intel]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zip-*
+          path: zips
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '{build-*,bin-clang-nightly-*,tested-clang-nightly-*}'
+          path: art
+
+      - name: Package the Windows builds (Windows x64 only if its CTest run passed)
+        run: |
+          set -euo pipefail
+          ls art
+          pkg() {  # <dir with install/ + info.txt> <platform>
+            if [ -d "$1/install" ]; then bash .github/compiler-bench/package.sh "$1" "$2" zips; fi
+          }
+          pkg art/build-Windows-arm64 Windows-arm64
+          for v in lto-pgo:Windows-x64 avx2-lto-pgo:Windows-x64-avx2; do
+            b=clang-nightly-${v%%:*}
+            if [ -f "art/tested-$b/tested.txt" ]; then pkg "art/bin-$b" "${v#*:}"; else echo "::warning::$b not tested OK"; fi
+          done
+
+      - name: Check every platform zip was built + summary
+        run: |
+          set -u
+          VER=$(sed -n 's/^set(VERSION \(.*\))/\1/p' CMakeLists.txt)
+          missing=0
+          {
+            echo "| Platform | Zip | Compiler | Flags |"
+            echo "|---|---|---|---|"
+          } > zips/platforms.md
+          for p in Windows-x64 Windows-x64-avx2 Windows-arm64 Linux-x64 Linux-x64-avx2 Linux-arm64 \
+                   macOS-x64 macOS-x64-avx2 macOS-arm64; do
+            z=zips/libjpeg-turbo-$VER-$p.zip
+            if [ -f "$z" ]; then
+              info=$(unzip -p "$z" "libjpeg-turbo-$VER-$p/BUILDINFO.txt")
+              cc=$(echo "$info" | sed -n 's/^compiler: *//p' | sed -E 's/ \(https:[^)]*\)//')
+              fl=$(echo "$info" | sed -n 's/^flags: *//p' | sed -E 's/-fprofile-use=[^ ]*/PGO/; s/ -Wno-[^ ]*//g')
+              echo "| $p | \`$(basename "$z")\` | $cc | \`$fl\` |" >> zips/platforms.md
+              echo "OK       $p"
+            else
+              echo "::error::missing platform zip: $p"; missing=1
+            fi
+          done
+          ls -l zips; cat zips/platforms.md | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $missing
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: all-platform-zips
+          path: |
+            zips/*.zip
+            zips/platforms.md
+          compression-level: 0
