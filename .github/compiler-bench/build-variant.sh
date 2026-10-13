@@ -55,7 +55,7 @@ configure_and_build() {  # $1 = extra C flags (PGO); verbose log appended to bui
         -DCMAKE_AR="$(command -v $AR)" -DCMAKE_RANLIB="$(command -v $RANLIB)" \
         -DCMAKE_STRIP="$(command -v $T-strip)" \
         -DCMAKE_ASM_NASM_COMPILER=nasm -DREQUIRE_SIMD=1 \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/libjpeg-turbo \
         -DCMAKE_C_FLAGS="$PERF $1" \
         -DCMAKE_EXE_LINKER_FLAGS=-static -DCMAKE_SHARED_LINKER_FLAGS=-static \
         -DFLOATTEST12=$FT12 >> "$OUT/build.log" 2>&1 || { tail -60 "$OUT/build.log"; exit 1; }
