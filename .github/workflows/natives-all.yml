@@ -1,0 +1,222 @@
+name: Natives (TurboJPEG shared library, 5 platforms + win64) build, test + release
+
+# Builds the TurboJPEG shared library (and the normal install tree) of this tree natively on each
+# platform's own GitHub runner, optimized like the winner of windows-x64-compilers.yml
+# (clang -O3 [-march=x86-64-v3] -ffast-math -flto + PGO), runs the project's full CTest suite on the
+# runner and smoke-tests the bare library loaded by path (the consumer loads it through Java's FFM API):
+#   linux-x64        ubuntu-22.04      (glibc 2.35 floor)  clang (apt.llvm.org), lld, -static-libgcc
+#   linux-aarch64    ubuntu-22.04-arm  (glibc 2.35 floor)  same
+#   mac-x64          macos-15-intel    min macOS 10.13     Apple clang + ld64
+#   mac-arm64        macos-14          min macOS 11.0      Apple clang + ld64
+#   windows-aarch64  windows-11-arm                        llvm-mingw (UCRT), static runtime
+# One job per platform (.github/natives/build-native.sh): PGO instrumented build -> native training run on
+# testimages/ -> llvm-profdata merge -> profile-use build (if the PGO step fails, the job ships the LTO
+# build and says so in its info file) -> ctest -> install, checks, smoke test, zip.
+# Release (input 'release', or a pushed tag 'natives-all-*'): GitHub release 'natives-all-<YYYYMMDD>'
+# (created, or updated in place) with the bare libraries, zips, info files and SHA256SUMS, plus
+# turbojpeg-windows-x64.dll taken from the winner zip of release win64-compilers-20261013-4.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish the tested builds as GitHub release natives-all-<YYYYMMDD>'
+        type: boolean
+        default: false
+  push:
+    tags: ['natives-all-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: natives-all-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VER: '23'                    # Linux: apt.llvm.org llvm-toolchain-jammy-23
+  LLVM_MINGW_VER: '20261006'        # Windows arm64: llvm-mingw with LLVM 23.1.3
+  WIN64_RELEASE: 'win64-compilers-20261013-4'
+  WIN64_ZIP: 'libjpeg-turbo-3.2.1-win64-clang-nightly-avx2-lto-pgo.zip'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+
+jobs:
+  natives:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64,       runner: ubuntu-22.04 }
+          - { platform: linux-aarch64,   runner: ubuntu-22.04-arm }
+          - { platform: mac-x64,         runner: macos-15-intel }
+          - { platform: mac-arm64,       runner: macos-14 }
+          - { platform: windows-aarch64, runner: windows-11-arm }
+    defaults:
+      run:
+        shell: bash
+    env:
+      D: dist/${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain (Linux) - clang/lld/llvm ${{ env.LLVM_VER }} from apt.llvm.org, NASM, Ninja
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-$LLVM_VER main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build nasm \
+            clang-$LLVM_VER lld-$LLVM_VER llvm-$LLVM_VER libclang-rt-$LLVM_VER-dev
+          echo "LLVM_SUFFIX=-$LLVM_VER" >> "$GITHUB_ENV"
+
+      - name: Toolchain (macOS) - Apple clang, NASM, Ninja
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install ninja $([ "${{ matrix.platform }}" = mac-x64 ] && echo nasm)
+
+      - name: Toolchain (Windows arm64) - llvm-mingw ${{ env.LLVM_MINGW_VER }} (native aarch64)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = "llvm-mingw-$env:LLVM_MINGW_VER-ucrt-aarch64.zip"
+          Invoke-WebRequest -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/$env:LLVM_MINGW_VER/$zip" -OutFile llvm-mingw.zip
+          Expand-Archive -Path llvm-mingw.zip -DestinationPath C:\llvm-mingw-root -Force
+          $dir = (Get-ChildItem C:\llvm-mingw-root -Filter "llvm-mingw-*" -Directory | Select-Object -First 1).FullName
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: CMake (Windows arm64)
+        if: runner.os == 'Windows'
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.31.6'
+
+      - name: Ninja (Windows arm64)
+        if: runner.os == 'Windows'
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - name: Toolchain info
+        run: |
+          set -euo pipefail
+          case "${{ matrix.platform }}" in
+            linux-*) clang-$LLVM_VER --version; ld.lld-$LLVM_VER --version; command -v llvm-profdata-$LLVM_VER; nasm -v || true
+                     ldd --version | sed -n 1p ;;
+            mac-*)   xcodebuild -version; clang --version; xcrun --find llvm-profdata; sw_vers; nasm -v || true ;;
+            windows-*) aarch64-w64-mingw32-clang --version; command -v llvm-profdata llvm-ar llvm-readobj ;;
+          esac
+          cmake --version | sed -n 1p; ninja --version
+          uname -a
+
+      - name: PGO profile (instrumented build + native training run)
+        id: pgo
+        continue-on-error: true
+        run: bash .github/natives/build-native.sh profile ${{ matrix.platform }} "$D"
+
+      - name: Build (final, profile-use)
+        env:
+          PGO: ${{ steps.pgo.outcome == 'success' }}
+        run: bash .github/natives/build-native.sh build ${{ matrix.platform }} "$D"
+
+      - name: Test (full CTest suite, native)
+        run: bash .github/natives/build-native.sh test ${{ matrix.platform }} "$D"
+
+      - name: Package (install tree, checks, smoke test, zip)
+        run: bash .github/natives/build-native.sh package ${{ matrix.platform }} "$D"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: natives-${{ matrix.platform }}
+          path: ${{ env.D }}/pkg/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: logs-${{ matrix.platform }}
+          path: |
+            ${{ env.D }}/*.log
+            ${{ env.D }}/*.txt
+          retention-days: 7
+
+  release:
+    name: publish GitHub release
+    needs: natives
+    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/') || inputs.release) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: natives-*
+          path: art
+          merge-multiple: true
+
+      - name: windows-x64 from release ${{ env.WIN64_RELEASE }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p art win64
+          gh release download "$WIN64_RELEASE" --repo "$GITHUB_REPOSITORY" -p "$WIN64_ZIP" -D win64
+          (cd win64 && unzip -q "$WIN64_ZIP")
+          T=win64/${WIN64_ZIP%.zip}
+          F=art/turbojpeg-windows-x64.dll
+          cp "$T/bin/libturbojpeg.dll" "$F"
+          objdump -p "$F" > win64/objdump.txt
+          grep -q 'file format pei-x86-64' win64/objdump.txt
+          DEPS=$(sed -n 's/^\s*DLL Name: *//p' win64/objdump.txt | tr '\n' ' ')
+          TJ3=$(grep -oE '[[:space:]]tj3[A-Za-z0-9_]+$' win64/objdump.txt | tr -d ' \t' | sort -u | wc -l)   # export table only
+          test "$TJ3" -gt 0
+          {
+            echo "platform: windows-x64"
+            echo "file: turbojpeg-windows-x64.dll"
+            echo "source: $WIN64_ZIP:bin/libturbojpeg.dll (release $WIN64_RELEASE)"
+            echo "size: $(stat -c %s "$F")"
+            echo "sha256: $(sha256sum "$F" | cut -d' ' -f1)"
+            echo "variant: avx2-lto-pgo"
+            echo "compiler: $(sed -n 's/^compiler: //p' "$T/info.txt")"
+            echo "cflags: -O3 -march=x86-64-v3 -ffast-math -flto -fprofile-use=<training profile>"
+            echo "ldflags: -static"
+            echo "pgo: yes: instrumented tjbench/cjpeg/djpeg/jpegtran (+ -static builds) trained under Wine on testimages/"
+            echo "cpu: x86-64-v3: AVX2/FMA/BMI2 (Intel Haswell / AMD Zen 1 or newer)"
+            echo "floor: Windows 10+ x64 (UCRT)"
+            echo "deps: $DEPS"
+            echo "tj3_exports: $TJ3"
+            echo "ctest: 662/662 passed (full CTest suite natively on windows-latest, see bench-results.md)"
+          } > art/info-windows-x64.txt
+          cat art/info-windows-x64.txt
+
+      - name: Publish (create or update natives-all-<YYYYMMDD>)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER=$(sed -n 's/^set(VERSION \(.*\))/\1/p' CMakeLists.txt)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then TAG=$GITHUB_REF_NAME
+          else TAG="natives-all-$(date -u +%Y%m%d)"; fi
+          ls -l art
+          ls art/info-*.txt | grep -qv windows-x64 || { echo "::error::no platform build succeeded"; exit 1; }
+          (cd art && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          python3 -I .github/natives/release-notes.py art "$VER" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > notes.md
+          cat notes.md
+          TITLE="libjpeg-turbo $VER TurboJPEG natives: Linux, macOS, Windows (x64 + arm64), clang LTO+PGO"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" art/* --repo "$GITHUB_REPOSITORY" --clobber
+            # drop assets of an earlier run that this run did not produce (e.g. a -lto zip now -lto-pgo)
+            for a in $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'); do
+              [ -e "art/$a" ] || gh release delete-asset "$TAG" "$a" --repo "$GITHUB_REPOSITORY" --yes
+            done
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes-file notes.md
+          else
+            gh release create "$TAG" art/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$TITLE" --notes-file notes.md
+          fi
+          echo "release: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
