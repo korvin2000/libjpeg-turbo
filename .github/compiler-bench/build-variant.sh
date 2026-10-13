@@ -64,14 +64,21 @@ configure_and_build() {  # $1 = extra C flags (PGO); verbose log appended to bui
 
 # PGO training: exercise both DLLs (libturbojpeg via tjbench, libjpeg-62 via cjpeg/djpeg/jpegtran) and the
 # static-library builds (*-static.exe), in all modes the benchmark measures.
+w() {  # run a Windows program under Wine; show its output only if it fails
+    local rc=0
+    wine "$@" > "$WORK/wine.log" 2>&1 || rc=$?
+    if [ $rc != 0 ]; then echo "::error::wine $* failed (exit $rc)"; cat "$WORK/wine.log"; return $rc; fi
+}
+
 train() {
-    export WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" WINEPREFIX=$WORK/wineprefix
-    wineboot --init > /dev/null 2>&1 || true
+    export WINEDEBUG=-all,err+all WINEDLLOVERRIDES="mscoree,mshtml=" WINEPREFIX=$WORK/wineprefix
+    wine --version
+    wineboot --init > "$WORK/wineboot.log" 2>&1 || { echo "wineboot failed:"; cat "$WORK/wineboot.log"; }
     local t=$WORK/train
     rm -rf "$t" && mkdir -p "$t" && cp "$SRC"/testimages/* "$t/" && cd "$t"
     local s img
     for s in "" -static; do
-        tj() { wine "$B/tjbench$s.exe" "$@" -benchtime 0.2 -warmup 0 -qq -nowrite > /dev/null; }
+        tj() { w "$B/tjbench$s.exe" "$@" -benchtime 0.2 -warmup 0 -qq -nowrite; }
         for img in testorig.ppm vgl_6548_0026a.bmp shira_bird8.bmp; do
             tj $img 95                                   # gray, 4:2:0, 4:2:2, 4:4:4
             tj $img 75 -subsamp 420 -progressive
@@ -82,12 +89,12 @@ train() {
         tj monkey16.pgm 1 -lossless -precision 16
         tj testorig.ppm 1 -lossless -precision 16
         tj testorig.jpg                                  # decompression + lossless transforms
-        wine "$B/cjpeg$s.exe" -quality 90 -outfile o1.jpg testorig.ppm
-        wine "$B/cjpeg$s.exe" -progressive -outfile o2.jpg vgl_6548_0026a.bmp
-        wine "$B/djpeg$s.exe" -outfile o1.ppm o1.jpg
-        wine "$B/djpeg$s.exe" -bmp -outfile o2.bmp o2.jpg
-        wine "$B/djpeg$s.exe" -outfile o3.ppm testimgari.jpg
-        wine "$B/jpegtran$s.exe" -rotate 90 -optimize -outfile o3.jpg testorig.jpg
+        w "$B/cjpeg$s.exe" -quality 90 -outfile o1.jpg testorig.ppm
+        w "$B/cjpeg$s.exe" -progressive -outfile o2.jpg vgl_6548_0026a.bmp
+        w "$B/djpeg$s.exe" -outfile o1.ppm o1.jpg
+        w "$B/djpeg$s.exe" -bmp -outfile o2.bmp o2.jpg
+        w "$B/djpeg$s.exe" -outfile o3.ppm testimgari.jpg
+        w "$B/jpegtran$s.exe" -rotate 90 -optimize -outfile o3.jpg testorig.jpg
     done
     cd "$SRC"
 }
