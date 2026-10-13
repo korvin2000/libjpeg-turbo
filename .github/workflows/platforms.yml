@@ -192,12 +192,14 @@ jobs:
         if: matrix.rosetta
         run: sudo softwareupdate --install-rosetta --agree-to-license
 
-      - name: Install Homebrew LLVM + NASM
+      - name: Install the newest Homebrew LLVM + NASM
         env:
           HOMEBREW_NO_INSTALL_CLEANUP: 1
         run: |
           set -euo pipefail
+          brew update --quiet   # the runner image's formula index is weeks old (auto-update is off)
           brew install llvm nasm ninja
+          brew info --json=v2 llvm | python3 -c "import sys,json; print('llvm', json.load(sys.stdin)['formulae'][0]['installed'][0]['version'])"
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
 
