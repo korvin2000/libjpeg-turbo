@@ -32,6 +32,7 @@ for f in a.jpg b.jpg c.jpg d.jpg a.ppm b.ppm d.ppm e.ppm f.jpg; do
 done > md5.txt
 cat md5.txt
 EXPECTED=$HERE/smoke-expected.txt
-cd / && if diff "$EXPECTED" "$T/md5.txt"; then echo "smoke test OK"; rc=0; else echo "::error::smoke test: outputs differ from $EXPECTED"; rc=1; fi
+tr -d '\r' < "$EXPECTED" > "$T/expected.txt"   # (Windows checkouts may turn it into CRLF)
+cd / && if diff "$T/expected.txt" "$T/md5.txt"; then echo "smoke test OK"; rc=0; else echo "::error::smoke test: outputs differ from $EXPECTED"; rc=1; fi
 rm -rf "$T"
 exit $rc

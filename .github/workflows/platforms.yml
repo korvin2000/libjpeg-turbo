@@ -13,8 +13,9 @@ name: CI (all platforms)
 # the static libraries stay plain object code) + PGO. The x64 builds come in two flavours: portable
 # (any x86-64 CPU; the SIMD code picks SSE2/AVX2 at run time) and -avx2 (-march=x86-64-v3: AVX2/FMA/BMI2,
 # Haswell / Zen 1 or newer; the benchmark winner, see bench-results.md). arm64: NEON, generic ARMv8-A.
-# Every build runs the project's full CTest suite and a smoke test of its unpacked zip
-# (.github/compiler-bench/smoke.sh: identical integer-path outputs on every platform).
+# Every build runs the project's full CTest suite (run-ctest.sh: -ffast-math builds whose opt-in 12-bit
+# float IDCT is off by 1 LSB get a tolerance check for those two tests instead) and a smoke test of its
+# unpacked zip (smoke.sh: identical integer-path outputs on every platform).
 on:
   push:
     branches: ['main', 'ci-platforms']
@@ -80,7 +81,7 @@ jobs:
 
       - name: Test (ctest, native arm64)
         shell: bash
-        run: ctest --test-dir dist/work-Windows-arm64/build -j4 --output-on-failure --timeout 900
+        run: bash .github/compiler-bench/run-ctest.sh dist/work-Windows-arm64/build dist/Windows-arm64 testimages
 
       - name: Smoke test of the install tree (moved away from the build tree)
         shell: bash
@@ -157,7 +158,7 @@ jobs:
           fi
 
       - name: Test (ctest, native)
-        run: ctest --test-dir dist/work-${{ matrix.platform }}/build -j"$(nproc)" --output-on-failure --timeout 900
+        run: bash .github/compiler-bench/run-ctest.sh dist/work-${{ matrix.platform }}/build dist/${{ matrix.platform }} testimages
 
       - name: Package + smoke test of the unpacked zip
         run: |
@@ -228,7 +229,7 @@ jobs:
           done
 
       - name: Test (ctest${{ matrix.rosetta && ', x86_64 binaries under Rosetta 2' || '' }})
-        run: ctest --test-dir dist/work-${{ matrix.platform }}/build -j"$(sysctl -n hw.ncpu)" --output-on-failure --timeout 900
+        run: bash .github/compiler-bench/run-ctest.sh dist/work-${{ matrix.platform }}/build dist/${{ matrix.platform }} testimages
 
       - name: Package + smoke test of the unpacked zip
         run: |

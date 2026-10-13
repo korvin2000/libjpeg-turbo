@@ -25,9 +25,11 @@
 # stay plain machine code that any compiler/linker can use. PGO training = the instrumented tjbench /
 # cjpeg / djpeg / jpegtran (shared + static builds) on the repo's testimages/ (not on the benchmark corpus).
 # Output dir: install/ (stripped 'cmake --install' tree = release payload), info.txt, build.log,
-# cc-cmd.txt (a real compile command line of the shared TurboJPEG library); Windows targets also get
+# cc-cmd.txt (a real compile command line of the shared TurboJPEG library), ref/djpeg-static (-ffast-math
+# builds: the same compiler's djpeg without -ffast-math, see run-ctest.sh); Windows targets also get
 # testbin/ (every .exe/.dll of the build tree at its relative path, for the native CTest run of
-# cross builds). The build tree stays in <out-dir>/../work-<name>/build (native builds run ctest there).
+# cross builds). The build tree stays in <out-dir>/../work-<name>/build; native builds test it with
+# run-ctest.sh <that build dir> <out-dir> testimages.
 set -euo pipefail
 
 CC_KIND=$1
@@ -175,7 +177,20 @@ done
 LAST_O=$(grep -oE ' -O[0-3s]' "$OUT/cc-cmd.txt" | tail -1)
 [ "$LAST_O" = " -O3" ] || { echo "::error::effective optimization level is '$LAST_O', expected -O3"; exit 1; }
 
-rm -rf "$OUT/install" "$OUT/testbin"
+rm -rf "$OUT/install" "$OUT/testbin" "$OUT/ref"
+# -ffast-math builds: the same compiler's djpeg without it = the reference of run-ctest.sh's 12-bit float
+# IDCT tolerance check
+if [[ " $PERF " == *" -ffast-math "* ]]; then
+    echo "::group::reference djpeg-static (no -ffast-math)"
+    R=$WORK/ref
+    rm -rf "$R"
+    cmake -S "$SRC" -B "$R" -G Ninja "${CMAKE_ARGS[@]}" -DCMAKE_C_COMPILER="$CC" \
+        -DCMAKE_EXE_LINKER_FLAGS="$LINK" -DCMAKE_SHARED_LINKER_FLAGS="$LINK" > "$OUT/build-ref.log" 2>&1 \
+        && cmake --build "$R" --target djpeg-static -j"$JOBS" >> "$OUT/build-ref.log" 2>&1 \
+        || { tail -60 "$OUT/build-ref.log"; exit 1; }
+    mkdir -p "$OUT/ref" && cp "$R/djpeg-static$EXE" "$OUT/ref/"
+    echo "::endgroup::"
+fi
 cmake --install "$B" --prefix "$OUT/install" --strip > /dev/null
 "$PY" "$SRC/.github/compiler-bench/check-static-libs.py" "$OUT"/install/lib/*.a
 if [ -n "$EXE" ]; then
